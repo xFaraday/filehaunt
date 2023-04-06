@@ -306,7 +306,9 @@ func VerifyRunIntegrity() {
 			if err != nil {
 				panic(err)
 			}
-			if stats.Mode().Perm() != 0600 {
+			if f.Name() == "filehaunt" && stats.Mode().Perm() != 0700 {
+				os.Chmod(fpath, 0700)
+			} else if stats.Mode().Perm() != 0600 {
 				os.Chmod(fpath, 0600)
 			}
 		}
