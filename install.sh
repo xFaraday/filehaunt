@@ -1,18 +1,23 @@
 #!/bin/bash
 
+#install to path
+firstdir=$(echo $PATH | cut -d':' -f1)
+
 # check if filehaunt binary exists
 if [ ! -f filehaunt ]; then
     echo "[-] filehaunt binary not found"
-    go build -o filehaunt
+    go build
     if [ $? -ne 0 ]; then
         echo "[-] failed to build filehaunt binary"
         exit 1
     else
         echo "[+] filehaunt binary built"
+        cp filehaunt $firstdir
         mv filehaunt /opt/filehaunt
     fi
 else 
     echo "[+] filehaunt binary found"
+    cp filehaunt $firstdir
     mv filehaunt /opt/filehaunt
 fi
 
