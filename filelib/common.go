@@ -33,7 +33,7 @@ func ContainsInt(s []int, e int) bool {
 	return i < len(s) && s[i] == e
 }
 
-func CheckFile(name string) finfo {
+func CheckFile(name string) (finfo, error) {
 	fileInfo, err := os.Stat(name)
 	if err != nil {
 		i := finfo{
@@ -42,7 +42,7 @@ func CheckFile(name string) finfo {
 			Time: "",
 			Hash: "",
 		}
-		return i
+		return i, err
 	}
 	if fileInfo.IsDir() {
 
@@ -56,7 +56,7 @@ func CheckFile(name string) finfo {
 			Hash: "directory",
 		}
 
-		return i
+		return i, err
 	} else {
 		f, err := os.Open(name)
 		if err != nil {
@@ -83,7 +83,7 @@ func CheckFile(name string) finfo {
 			Time: t,
 			Hash: Enc,
 		}
-		return i
+		return i, err
 	}
 }
 
@@ -115,7 +115,7 @@ func Decompress(in io.Reader, out io.Writer) error {
 
 func OpenFile(file string) []string {
 	var s []string
-	stats := CheckFile(file)
+	stats, _ := CheckFile(file)
 	if stats.Size != 0 {
 		f, err := os.Open(file)
 		if err != nil {

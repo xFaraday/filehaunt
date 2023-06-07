@@ -2,13 +2,19 @@ package filelib
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/base64"
 	"io"
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/blockloop/scan"
+	"github.com/fsnotify/fsnotify"
+	"github.com/xFaraday/filehaunt/db"
 	"go.uber.org/zap"
 )
 
@@ -16,61 +22,127 @@ var (
 	indexfile = "/opt/filehaunt/index.safe"
 )
 
+type fileindex struct {
+	filepath   string
+	name       string
+	backupfile string
+	backuptime string
+	hash       string
+}
+
 /*
 	Add edge case check in VerifyFiles() to see if the file has been deleted
 		- if so, unzip compressed file back to original spot
 		- if not, proceed as normal
 */
 
+func WatchDir(dir string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		zap.S().Error("Unable to watch directory: ", dir)
+	}
+
+	defer watcher.Close()
+
+	done := make(chan bool)
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+
+				if event.Op&fsnotify.Create == fsnotify.Create {
+					zap.S().Info("File Created: ", event.Name, " in Dir: ", dir)
+					os.Remove(event.Name)
+				}
+
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				zap.S().Error(err)
+			}
+		}
+	}()
+
+	err = watcher.Add(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	<-done
+
+}
+
 func VerifyFiles() {
-	safestats := CheckFile(indexfile)
-	if safestats.Size != 0 {
-		f := OpenFile(indexfile)
-		for _, indexstr := range f {
-			splittysplit := strings.Split(indexstr, "|-:-|")
+	countbackedfiles := db.CountRows("fileindex")
+	if countbackedfiles != 0 {
+		conn := db.DbConnect()
+		rows, err := conn.Query("SELECT * FROM fileindex")
+		if err != nil {
+			zap.S().Error("Unable to query fileindex table in Database")
+		}
+		defer rows.Close()
 
-			if _, err := os.Stat(splittysplit[0]); err != nil {
+		var fileinfo []fileindex
+		err1 := scan.Rows(&fileinfo, rows)
+		if err1 != nil {
+			zap.S().Error(err1)
+		}
+
+		for _, f := range fileinfo {
+			if _, err := os.Stat(f.filepath); err != nil {
 				if os.IsNotExist(err) {
-					CompressedBackup := dirforbackups + splittysplit[2]
-					tmpcmpfile, _ := os.Create("/tmp/" + splittysplit[1] + ".tmp")
+					CompressedBackup := dirforbackups + f.backupfile
+					TmpCmpFile, _ := os.Create("/tmp" + f.name + ".tmp")
 					RevertCompressedFile, _ := os.Open(CompressedBackup)
-					Decompress(RevertCompressedFile, tmpcmpfile)
-					oGfile, _ := os.Create(splittysplit[0])
+					Decompress(RevertCompressedFile, TmpCmpFile)
+					oGfile, _ := os.Create(f.filepath)
 
-					zap.S().Warn("File:" + splittysplit[0] + " has been deleted, restoring from backup")
+					zap.S().Warn("File:" + f.filepath + " has been deleted, restoring from backup")
 
-					OverWriteModifiedFile(oGfile.Name(), tmpcmpfile.Name())
-					os.Remove(tmpcmpfile.Name())
+					OverWriteModifiedFile(oGfile.Name(), TmpCmpFile.Name())
+					os.Remove(TmpCmpFile.Name())
 				} else {
 					panic(err)
 				}
 			}
 
-			fCurrentStats := CheckFile(splittysplit[0])
-			if fCurrentStats.Hash != splittysplit[4] {
-				CompressedBackup := dirforbackups + splittysplit[2]
-				//get uncompressed version
-				tmpcmpfile, _ := os.Create("/tmp/" + splittysplit[1] + ".tmp")
+			fCurrentStats, _ := CheckFile(f.filepath)
+			if fCurrentStats.Hash != f.hash {
+				CompressedBackup := dirforbackups + f.backupfile
+				TmpCmpFile, _ := os.Create("/tmp" + f.name + ".tmp")
 				RevertCompressedFile, _ := os.Open(CompressedBackup)
-
-				Decompress(RevertCompressedFile, tmpcmpfile)
+				Decompress(RevertCompressedFile, TmpCmpFile)
 
 				//FIGURE OUT IF TXT FILE THEN TRY TO GET DIFF
-				diff, _ := GetDiff(splittysplit[0], tmpcmpfile.Name())
+				diff, _ := GetDiff(f.filepath, TmpCmpFile.Name())
 				if diff == "binary, no diff" {
-					zap.S().Warn("File:" + splittysplit[0] + " has been modified, but is binary, no diff available")
+					zap.S().Warn("File:" + f.filepath + " has been modified, but is binary, no diff available")
 				} else {
 					zlog := zap.S().With(
-						"file", splittysplit[0],
+						"file", f.filepath,
 						"diff", diff,
 					)
 					zlog.Warn("File has been modified, diff below")
 				}
 
+				h := sha256.New()
+				h.Write([]byte(diff))
+				Enc := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+				stmt := db.InsertIntoTable("filechanges")
+				_, err := stmt.Exec(f.filepath, fCurrentStats.Time, diff, Enc)
+				if err != nil {
+					zap.S().Error("Unable to log diff in table: filechanges")
+				}
+
 				//actions once the difference is logged
-				OverWriteModifiedFile(splittysplit[0], tmpcmpfile.Name())
-				os.Remove(tmpcmpfile.Name())
-				zap.S().Info("File: " + splittysplit[0] + " has been restored to original state")
+				OverWriteModifiedFile(f.filepath, TmpCmpFile.Name())
+				os.Remove(TmpCmpFile.Name())
+				zap.S().Info("File: " + f.filepath + " has been restored to original state")
 			}
 		}
 	}
@@ -102,16 +174,31 @@ func BackFile(storename string, file string /*, mode int*/) {
 }
 
 func ExistsInIndex(indexfile string, file string) string {
-	strlist := OpenFile(indexfile)
+	//strlist := OpenFile(indexfile)
 
-	for _, indexstr := range strlist {
-		splittysplit := strings.Split(indexstr, "|-:-|")
-		if splittysplit[0] == file {
-			println("exact file exists in index")
-			return "newback"
-		}
+	var count int
+
+	conn := db.DbConnect()
+	query := "SELECT COUNT(filepath) FROM fileindex where filepath = " + file
+	if err := conn.QueryRow(query).Scan(&count); err != nil {
+		zap.S().Warn("Unable to get count of table: fileindex")
 	}
-	return "new"
+
+	if count != 0 {
+		return "new"
+	} else {
+		return "newback"
+	}
+	/*
+		for _, indexstr := range strlist {
+			splittysplit := strings.Split(indexstr, "|-:-|")
+			if splittysplit[0] == file {
+				println("exact file exists in index")
+				return "newback"
+			}
+		}
+	*/
+	//return "new"
 }
 
 func OverWriteModifiedFile(OriginalPath string, FileBackup string) {
@@ -159,7 +246,7 @@ func GenRandomName() string {
 }
 
 func CreateRestorePoint(file string, overwrite bool) {
-	stats := CheckFile(file)
+	stats, _ := CheckFile(file)
 	VerifyRunIntegrity()
 	if stats.Size != 0 {
 		/*
@@ -179,16 +266,7 @@ func CreateRestorePoint(file string, overwrite bool) {
 			// /etc/passwd-:-passwd.txt-:-some date-:-hash
 			backname := GenRandomName() + ".zst"
 			indexstr := file + "|-:-|" + storename + "|-:-|" + backname + "|-:-|" + stats.Time + "|-:-|" + string(stats.Hash) + "\n"
-			//newindextstr := []byte(indexstr)
 
-			//if _, err := os.Stat(indexfile); os.IsNotExist(err) {
-			//	werr := ioutil.WriteFile(indexfile, newindextstr, 0644)
-			//	if werr != nil {
-			//		panic(werr)
-			//	}
-			//
-			//	BackFile(backname, file)
-			//} else {
 			checkresult := ExistsInIndex(indexfile, file)
 
 			switch checkresult {
@@ -208,6 +286,13 @@ func CreateRestorePoint(file string, overwrite bool) {
 					panic(err)
 				}
 				appendfile.WriteString(indexstr)
+
+				stmt := db.InsertIntoTable("fileindex")
+				_, err1 := stmt.Exec(file, storename, backname, stats.Time, stats.Hash)
+				if err1 != nil {
+					zap.S().Fatal("Unable to insert metadata on file: ", file, " into database!")
+				}
+
 				defer appendfile.Close()
 
 				zap.S().Info("BACKUP File: " + file + " has been backed up sucessfully")
